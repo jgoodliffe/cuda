@@ -22,7 +22,7 @@ int BLOCK_SIZE = 1024;
 int SEGMENT_SIZE = 2 * BLOCK_SIZE;
 
 //Define functions...
-cudaError_t fullScan(int* out, int* in, const int size); 
+cudaError_t fullScan(int* out, int* in, const int size, int* sums_out); 
 cudaError_t fullScan2(int* out, int* in, const int size);
 
 //Prescan with bank conflict avoidance...
@@ -91,14 +91,16 @@ __global__ void prescan2(int* outputData, int* inputData, int n, int ss) {
 }
 
 //Std prescan...
+//All operations are performed in memory, so the function is 'void' and doesn't return anything...
 //outputData - output array, inputData - input array, n- arraysize, ss- segment size
-__global__ void prescan(int* outputData, int* inputData, int n, int ss) {
+__global__ void prescan(int* outputData, int* inputData, int n, int ss, int* sums) {
 	extern __shared__ int temp[]; //Allocated on invocation - Pointer to shared memory
 
 	//ThreadId - 0 --> total number of threads provided..
 	int threadID = threadIdx.x;
 	int offset = 1;
 	int gThreadID = blockIdx.x * blockDim.x + threadIdx.x;
+	//Sums array - (gThreadID/BlockSize - 1)
 
 	//Max data access - 2x thread id.
 	if (2 * gThreadID < n) {
@@ -121,6 +123,8 @@ __global__ void prescan(int* outputData, int* inputData, int n, int ss) {
 
 	//Clear the last element
 	if (threadID == 0) {
+		//Capture 'sum' here...
+		sums[blockIdx.x] = temp[ss - 1];
 		temp[ss - 1] = 0;
 	}
 
@@ -148,18 +152,29 @@ __global__ void prescan(int* outputData, int* inputData, int n, int ss) {
 	}
 }
 
-
+//TODO:
+//Prescan the sums array - duplicate function + remove summing bit
+//Write device function (sumsArray totals) - Adds to init scan.
+//End result - all items in the array added up...
 
 //Main Method
 int main()
 {
 	//Initialise array...k
-	const int arraySize = 10000;
+	const int arraySize = 5000;
+	int sumArraySize = ceil(arraySize / float(SEGMENT_SIZE));
 
-	int inputArray[arraySize];
-	int inputArray2[arraySize];
-	int outputArray[arraySize];
-	int outputArray2[arraySize];
+	//int inputArray[arraySize];
+	//int inputArray2[arraySize];
+	//int outputArray[arraySize];
+	//int outputArray2[arraySize];
+
+	//Malloc all arrays
+	int* sumsArray = (int*)malloc(sumArraySize * sizeof(int));
+	int* inputArray = (int*)malloc(arraySize * sizeof(int));
+	int* inputArray2 = (int*)malloc(arraySize * sizeof(int));
+	int* outputArray = (int*)malloc(arraySize * sizeof(int));
+	int* outputArray2 = (int*)malloc(arraySize * sizeof(int));
 
 	//Create array to input...
 	for (int i = 0; i < arraySize; i++) {
@@ -173,17 +188,23 @@ int main()
 		printf("%d ", inputArray2[i]);
 	}
 
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = fullScan(outputArray, inputArray, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "Prescan failed!");
-        return 1;
-    }
+	// Add vectors in parallel.
+	cudaError_t cudaStatus = fullScan(outputArray, inputArray, arraySize, sumsArray);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "Prescan failed!");
+		return 1;
+	}
 
 	//Output results
-	printf("\n\n");
-	for(int i = 0; i < arraySize; i++) {
+	printf("\n\n OUTPUT ARRAY \n");
+	for (int i = 0; i < arraySize; i++) {
 		printf("%d ", outputArray[i]);
+	}
+
+	//Output S2 Sum results
+	printf("\n\n SUMS ARRAY : \n");
+	for (int i = 0; i < sumArraySize; i++) {
+		printf("%d ", sumsArray[i]);
 	}
 
 	// Add vectors in parallel - Bank conflict Avoidance
@@ -194,7 +215,7 @@ int main()
 	}
 
 	//Output results
-	printf("\n\n");
+	printf("\n\n OUTPUT ARRAY: \n");
 	for (int i = 0; i < arraySize; i++) {
 		printf("%d ", outputArray2[i]);
 	}
@@ -207,11 +228,17 @@ int main()
         return 1;
     }
 
+	//Free Memory:
+	free(inputArray);
+	free(inputArray2);
+	free(outputArray);
+	free(outputArray2);
+	free(sumsArray);
     return 0;
 }
 
 // Helper function for using CUDA to add vectors in parallel. size - array size;
-cudaError_t fullScan(int *out, int* in, const int size)
+cudaError_t fullScan(int* out, int* in, const int size, int* sums_out)
 {
 	//Init Stopwatch
 	StopWatchInterface* timer = NULL;
@@ -231,6 +258,8 @@ cudaError_t fullScan(int *out, int* in, const int size)
 	//Initialise arrays
     int *dev_in = 0;
     int *dev_out = 0;
+	int* dev_sums = 0;
+	int dev_sums_size = ceil(size/(float)SEGMENT_SIZE)*sizeof(int);
     
     cudaError_t cudaStatus;
 
@@ -241,7 +270,7 @@ cudaError_t fullScan(int *out, int* in, const int size)
         goto Error;
     }
 
-    // Allocate GPU buffers for three vectors (two input, one output)    .
+    // Allocate GPU buffers for three vectors (one input, one output, one sums)    .
 
     cudaStatus = cudaMalloc((void**)&dev_in, size * sizeof(int));
     if (cudaStatus != cudaSuccess) {
@@ -254,6 +283,12 @@ cudaError_t fullScan(int *out, int* in, const int size)
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
     }
+
+	cudaStatus = cudaMalloc((void**)&dev_sums, dev_sums_size);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
 
     // Copy input vectors from host memory to GPU buffers.
     cudaStatus = cudaMemcpy(dev_in, in, size * sizeof(int), cudaMemcpyHostToDevice);
@@ -274,7 +309,7 @@ cudaError_t fullScan(int *out, int* in, const int size)
 	//Launch prescan.
 	printf("\n Launching prescan - \nsize - %d seg size- %d", size, SEGMENT_SIZE);
 	printf("\n BlocksPer Grid- %d, threadsPerBlock %d, sharedMemAmount %d", blocksPerGrid, threadsPerBlock, sharedMemAmount);
-	prescan <<<blocksPerGrid,threadsPerBlock,sharedMemAmount>>> (dev_out, dev_in,size,SEGMENT_SIZE);
+	prescan <<<blocksPerGrid,threadsPerBlock,sharedMemAmount>>> (dev_out, dev_in,size,SEGMENT_SIZE,dev_sums);
 
     // Check for any errors launching the kernel
     cudaStatus = cudaGetLastError();
@@ -308,16 +343,24 @@ cudaError_t fullScan(int *out, int* in, const int size)
         goto Error;
     }
 
-    // Copy output vector from GPU buffer to host memory.
+    // Copy output array from GPU buffer to host memory.
     cudaStatus = cudaMemcpy(out, dev_out, size * sizeof(int), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "Failed to copy from GPU to Host!");
         goto Error;
     }
 
+	// Copy output sums from GPU buffer to host memory.
+	cudaStatus = cudaMemcpy(sums_out, dev_sums, dev_sums_size, cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "Failed to copy from GPU to Host!");
+		goto Error;
+	}
+
 Error:
     cudaFree(dev_in);
     cudaFree(dev_out);
+	cudaFree(dev_sums);
     
     return cudaStatus;
 }
