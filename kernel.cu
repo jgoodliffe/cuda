@@ -40,7 +40,7 @@ int BLOCK_SIZE = 1024;
 int SEGMENT_SIZE = 2 * BLOCK_SIZE;
 
 //Define functions...
-cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumulative_sums, int* L2_out); 
+cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumulative_sums, int* L2_out, int* L3_out); 
 cudaError_t fullScan_bcao(int* out, int* in, const int size);
 
 //Prescan with bank conflict avoidance...
@@ -108,25 +108,23 @@ __global__ void preScan_bcao(int* outputData, int* inputData, int n, int ss) {
 	}
 }
 
-//Std prescan...
-//All operations are performed in memory, so the function is 'void' and doesn't return anything...
-//outputData - output array, inputData - input array, n- arraysize, ss- segment size
-__global__ void prescan(int* outputData, int* inputData, int n, int ss, int* sums) {
+//Prescan, Sum
+//outputData - output array, inputData - input array, arraySize- arraysize, segSize- segment size
+__global__ void prescan_with_sum(int* outputData, int* inputData, int arraySize, int segSize, int* sums) {
 	extern __shared__ int temp[]; //Allocated on invocation - Pointer to shared memory
 
 	//ThreadId - 0 --> total number of threads provided..
 	int threadID = threadIdx.x;
 	int offset = 1;
 	int gThreadID = blockIdx.x * blockDim.x + threadIdx.x;
-	//Sums array - (gThreadID/BlockSize - 1)
 
 	//Max data access - 2x thread id.
-	if (2 * gThreadID < n) {
+	if (2 * gThreadID < arraySize) {
 		temp[2 * threadID] = inputData[2 * gThreadID]; //Load input into shared memory
 		temp[2 * threadID + 1] = inputData[2 * gThreadID + 1];
 	}
 
-	for (int d = ss>> 1; d > 0; d >>= 1) { //Build sum in place up the tree
+	for (int d = segSize>> 1; d > 0; d >>= 1) { //Build sum in place up the tree
 		__syncthreads();
 
 		if (threadID < d) {
@@ -142,12 +140,13 @@ __global__ void prescan(int* outputData, int* inputData, int n, int ss, int* sum
 	//Clear the last element
 	if (threadID == 0) {
 		//Capture 'sum' here...
-		sums[blockIdx.x] = temp[ss - 1];
-		temp[ss - 1] = 0;
+		sums[blockIdx.x] = temp[segSize - 1];
+		//printf("NEW SUM: %d", sums[blockIdx.x]);
+		temp[segSize - 1] = 0;
 	}
 
 	//Traverse the tree and build scan
-	for (int d = 1; d < ss; d *= 2) {
+	for (int d = 1; d < segSize; d *= 2) {
 		offset >>= 1;
 		__syncthreads();
 
@@ -164,14 +163,14 @@ __global__ void prescan(int* outputData, int* inputData, int n, int ss, int* sum
 	__syncthreads();
 
 	//Write the results to the device memory
-	if (2* gThreadID < n) {
+	if (2* gThreadID < arraySize) {
 		outputData[2 * gThreadID] = temp[2 * threadID];
 		outputData[2 * gThreadID + 1] = temp[2 * threadID + 1];
 	}
 }
 
 //Basic Prescan without summing.... (to perform a scan on the sums)
-__global__ void basicScan(int* outputData, int* inputData, int n, int ss) {
+__global__ void prescan_without_sum(int* outputData, int* inputData, int arraySize, int segSize) {
 	extern __shared__ int temp[]; //Allocated on invocation - Pointer to shared memory
 
 	//ThreadId - 0 --> total number of threads provided..
@@ -181,12 +180,12 @@ __global__ void basicScan(int* outputData, int* inputData, int n, int ss) {
 	//Sums array - (gThreadID/BlockSize - 1)
 
 	//Max data access - 2x thread id.
-	if (2 * gThreadID < n) {
+	if (2 * gThreadID < arraySize) {
 		temp[2 * threadID] = inputData[2 * gThreadID]; //Load input into shared memory
 		temp[2 * threadID + 1] = inputData[2 * gThreadID + 1];
 	}
 
-	for (int d = ss >> 1; d > 0; d >>= 1) { //Build sum in place up the tree
+	for (int d = segSize >> 1; d > 0; d >>= 1) { //Build sum in place up the tree
 		__syncthreads();
 
 		if (threadID < d) {
@@ -201,11 +200,11 @@ __global__ void basicScan(int* outputData, int* inputData, int n, int ss) {
 
 	//Clear the last element
 	if (threadID == 0) {
-		temp[ss - 1] = 0;
+		temp[segSize - 1] = 0;
 	}
 
 	//Traverse the tree and build scan
-	for (int d = 1; d < ss; d *= 2) {
+	for (int d = 1; d < segSize; d *= 2) {
 		offset >>= 1;
 		__syncthreads();
 
@@ -222,7 +221,7 @@ __global__ void basicScan(int* outputData, int* inputData, int n, int ss) {
 	__syncthreads();
 
 	//Write the results to the device memory
-	if (2 * gThreadID < n) {
+	if (2 * gThreadID < arraySize) {
 		outputData[2 * gThreadID] = temp[2 * threadID];
 		outputData[2 * gThreadID + 1] = temp[2 * threadID + 1];
 	}
@@ -230,25 +229,18 @@ __global__ void basicScan(int* outputData, int* inputData, int n, int ss) {
 
 //Modifies the input array to have all values <blockSize with the SumsArray values...
 //Level 2 Scan.. 
-__global__ void addSumsToScan(int* outputData, int* inputData, int* sumsArray, int n) {
-	int threadID = threadIdx.x;
+__global__ void addSumsToScan(int* summedArray, int* inputArray, int* sumsArray) {
 	int gThreadID = blockIdx.x * blockDim.x + threadIdx.x;
-	outputData[gThreadID] = inputData[gThreadID] + sumsArray[(blockIdx.x/2)];
-
-	//printf("\n Array item  with block value %d \n Adding %d to amount \n New value is ", blockIdx.x, sumsArray[blockIdx.x]);
+	summedArray[gThreadID] = inputArray[gThreadID] + sumsArray[(blockIdx.x/2)];
+	//printf("\n addSums: %d",summedArray[gThreadID]);
 }
 
-//Main Method
+//Main Methodn
 int main()
 {
 	//Initialise array...k
-	const int arraySize = 5000;
+	const int arraySize = 5000000;
 	int sumArraySize = ceil(arraySize / float(SEGMENT_SIZE));
-
-	//int inputArray[arraySize];
-	//int inputArray2[arraySize];
-	//int outputArray[arraySize];
-	//int outputArray2[arraySize];
 
 	//Malloc all arrays
 	int* sumsArray = (int*)malloc(sumArraySize * sizeof(int));
@@ -258,6 +250,7 @@ int main()
 	int* outputArray = (int*)malloc(arraySize * sizeof(int));
 	int* outputArray2 = (int*)malloc(arraySize * sizeof(int));
 	int* l2Array = (int*)malloc(arraySize * sizeof(int));
+	int* l3Array = (int*)malloc(arraySize * sizeof(int));
 
 	//Create array to input...
 	for (int i = 0; i < arraySize; i++) {
@@ -272,7 +265,7 @@ int main()
 	}
 
 	// Add vectors in parallel.
-	cudaError_t cudaStatus = fullScan(outputArray, inputArray, arraySize, sumsArray, cumSumsArray,l2Array);
+	cudaError_t cudaStatus = fullScan(outputArray, inputArray, arraySize, sumsArray, cumSumsArray,l2Array,l3Array);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "Prescan failed!");
 		return 1;
@@ -281,13 +274,19 @@ int main()
 	//Output results
 	printf("\n\n L1 SCAN: \n");
 	for (int i = 0; i < arraySize; i++) {
-		printf("%d ", outputArray[i]);
+		//printf("%d ", outputArray[i]);
 	}
 
 	//Output L2 Scan Results
 	printf("\n\n L2 SCAN: \n");
 	for (int i = 0; i < arraySize; i++) {
-		printf("%d ", l2Array[i]);
+		//printf("%d ", l2Array[i]);
+	}
+
+	//Output L3 Scan Results
+	printf("\n\n L3 SCAN: \n");
+	for (int i = 0; i < arraySize; i++) {
+		printf("%d ", l3Array[i]);
 	}
 
 	// Add vectors in parallel - Bank Conflict Avoidance Optimisation
@@ -318,22 +317,25 @@ int main()
 	free(outputArray2);
 	free(sumsArray);
 	free(l2Array);
+	free(l3Array);
     return 0;
 }
 
 // Helper function for using CUDA to add vectors in parallel. size - array size;
-cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumulative_sums, int* L2_out)
+cudaError_t fullScan(int* out, int* in, const int arraySize, int* sums_out, int* cumulative_sums, int* L2_out, int* L3_out)
 {
 	//Init Stopwatch
 	StopWatchInterface* timer = NULL;
 	double h_msecs = NULL;
 
 	//Properties for prescan
-	int inputVectorSize = size; //Size of the input vector (i.e. array)
+	int inputVectorSize = arraySize; //Size of the input vector (i.e. array)
 	int threadsPerBlock = 1024;
 	//int blocksPerGrid = 1 + (inputVectorSize - 1) / threadsPerBlock;
 	int blocksPerGrid = ceil(inputVectorSize / (float)SEGMENT_SIZE);
 	int blocksPerGrid_L2 = ceil(inputVectorSize /(float)threadsPerBlock);
+	int blocksPerGrid_L2_V2 = ceil(inputVectorSize / (float)(SEGMENT_SIZE * SEGMENT_SIZE));
+	int blocksPerGrid_L3 = 1; //(inputVectorSize)/SEGMENT_SIZE^3 = 1
 	int sharedMemAmount = (SEGMENT_SIZE) * sizeof(int); //Amount of shared memory given to prescan 
 
 	//Init cuda timer
@@ -341,13 +343,23 @@ cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumu
 	float d_msecs;
 
 	//Initialise arrays
-    int *dev_in = 0; //Input array
-    int *dev_out = 0; //1st Scan Output
+    int *l1_in = 0; //Input array
+    int *l1_out = 0; //1st Scan Output
 	int* dev_sums = 0; //Sums 
  	int* dev_cumulative = 0; //Cumulative sums
-	int* dev_L2 = 0; //2nd Scan Output
-	int dev_sums_size = ceil(size/(float)SEGMENT_SIZE)*sizeof(int);
-    
+	int* l2_out = 0; //2nd Scan Output
+	int* dev_L3 = 0; //3rd Scan Output
+	int* l3_temp = 0; //Temp Scan Output 1
+	int* l3_temp2 = 0; //Temp Scan Output 2
+	int* l3_temp3 = 0; //Temp Scan Output 3
+	int* l3_temp4 = 0; //Temp Scan Output 3
+	int* sums_L3_Stage1 = 0; //L3 Scan Sums - Stage 1
+	int* sums_L3_Stage2 = 0; //L3 Scan Sums - Stage 2
+	int* dev_cumulative_L2 = 0; // L3 Cumulative Sums
+
+	int dev_sums_size = ceil(arraySize/(float)SEGMENT_SIZE)*sizeof(int);
+	int dev_L3_sums_size = blocksPerGrid/(float)SEGMENT_SIZE;
+
     cudaError_t cudaStatus;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
@@ -359,19 +371,49 @@ cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumu
 
     // Allocate GPU buffers for three vectors (one input, one output, one sums)    .
 
-    cudaStatus = cudaMalloc((void**)&dev_in, size * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&l1_in, arraySize * sizeof(int));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
     }
 
-    cudaStatus = cudaMalloc((void**)&dev_out, size * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&l1_out, arraySize * sizeof(int));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
     }
 
-	cudaStatus = cudaMalloc((void**)&dev_L2, size * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&l2_out, arraySize * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_L3, arraySize * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&l3_temp, arraySize * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&l3_temp2, (blocksPerGrid * sizeof(int)));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&l3_temp3, (blocksPerGrid_L2_V2 * sizeof(int)));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&l3_temp4, arraySize * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
@@ -383,14 +425,33 @@ cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumu
 		goto Error;
 	}
 
+	cudaStatus = cudaMalloc((void**)&sums_L3_Stage1, (blocksPerGrid*sizeof(int)));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&sums_L3_Stage2, (blocksPerGrid_L2_V2*(sizeof(int))));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+
 	cudaStatus = cudaMalloc((void**)&dev_cumulative, dev_sums_size);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
 	}
 
+	cudaStatus = cudaMalloc((void**)&dev_cumulative_L2, dev_sums_size);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
     // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_in, in, size * sizeof(int), cudaMemcpyHostToDevice);
+    cudaStatus = cudaMemcpy(l1_in, in, arraySize * sizeof(int), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "Failed to copy input from system to GPU!");
         goto Error;
@@ -405,16 +466,25 @@ cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumu
 	cudaEventCreate(&stop);
 	cudaEventRecord(start, 0);
 
-	//Launch prescan.
-	printf("\n Launching prescan - \nsize - %d seg size- %d", size, SEGMENT_SIZE);
-	printf("\n BlocksPer Grid- %d, threadsPerBlock %d, sharedMemAmount %d", blocksPerGrid, threadsPerBlock, sharedMemAmount);
-	prescan <<<blocksPerGrid,threadsPerBlock,sharedMemAmount>>> (dev_out, dev_in,size,SEGMENT_SIZE,dev_sums);
+	//Launch Level 1 Scan.
+	//printf("\n Launching prescan - \nsize - %d seg size- %d", size, SEGMENT_SIZE);
+	//printf("\n BlocksPer Grid- %d, threadsPerBlock %d, sharedMemAmount %d", blocksPerGrid, threadsPerBlock, sharedMemAmount);
+	prescan_with_sum <<<blocksPerGrid,threadsPerBlock,sharedMemAmount>>> (l1_out, l1_in,arraySize,SEGMENT_SIZE,dev_sums); 
 
-	//Run a prescan on the sums array.
-	basicScan <<<blocksPerGrid,threadsPerBlock,sharedMemAmount>>> (dev_cumulative,dev_sums,dev_sums_size,SEGMENT_SIZE);
+	//Level 2 - Run a prescan on the sums array.
+	prescan_without_sum <<<blocksPerGrid,threadsPerBlock,sharedMemAmount>>> (dev_cumulative,dev_sums,dev_sums_size,SEGMENT_SIZE);
+	addSumsToScan << <blocksPerGrid_L2, threadsPerBlock, sharedMemAmount >> > (l2_out, l1_out, dev_cumulative); 
 
-	//Add dev_cumulative to values in dev_out
-	addSumsToScan << <blocksPerGrid_L2,threadsPerBlock,sharedMemAmount>> > (dev_L2,dev_out,dev_cumulative,size);
+	//Level 3 - 
+	//prescan_with_sum(outputData, inputData, arraySize, segSize, sums)
+	prescan_with_sum << <blocksPerGrid, threadsPerBlock, sharedMemAmount >> > (l3_temp, l1_in, arraySize, SEGMENT_SIZE, sums_L3_Stage1);
+	prescan_with_sum << <blocksPerGrid_L2_V2, threadsPerBlock, sharedMemAmount >> > (l3_temp2, sums_L3_Stage1, blocksPerGrid, SEGMENT_SIZE,sums_L3_Stage2);
+	//prescan_without_sum(outputData, inputData, arraySize, segSize)
+	prescan_without_sum << <blocksPerGrid_L3, threadsPerBlock, sharedMemAmount >> > (l3_temp3,sums_L3_Stage2,blocksPerGrid_L2_V2,SEGMENT_SIZE);
+	//addSumsToScan(summedArray, inputArray, sumsArray)
+	addSumsToScan << <blocksPerGrid_L2_V2*2*2,threadsPerBlock>> > (l3_temp4,l3_temp2, l3_temp3);
+	addSumsToScan << <blocksPerGrid*2, threadsPerBlock>> > (dev_L3, l3_temp,l3_temp4);
+
 
     // Check for any errors launching the kernel
     cudaStatus = cudaGetLastError();
@@ -449,7 +519,7 @@ cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumu
     }
 
     // Scan - Copy output array from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(out, dev_out, size * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaStatus = cudaMemcpy(out, l1_out, arraySize * sizeof(int), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "Failed to copy from GPU to Host!");
         goto Error;
@@ -470,18 +540,34 @@ cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumu
 	}
 
 	// L2 - Copy output sums from GPU buffer to host memory.
-	cudaStatus = cudaMemcpy(L2_out, dev_L2 , size*sizeof(int), cudaMemcpyDeviceToHost);
+	cudaStatus = cudaMemcpy(L2_out, l2_out , arraySize*sizeof(int), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "Failed to copy from GPU to Host!");
+		goto Error;
+	}
+
+	// L3 - Copy output sums from GPU buffer to host memory.
+	cudaStatus = cudaMemcpy(L3_out, dev_L3, arraySize * sizeof(int), cudaMemcpyDeviceToHost);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "Failed to copy from GPU to Host!");
 		goto Error;
 	}
 
 Error:
-    cudaFree(dev_in);
-    cudaFree(dev_out);
+    cudaFree(l1_in);
+    cudaFree(l1_out);
 	cudaFree(dev_sums);
 	cudaFree(dev_cumulative);
-	cudaFree(dev_L2);
+	cudaFree(sums_L3_Stage1);
+	cudaFree(sums_L3_Stage2);
+	cudaFree(dev_cumulative_L2);
+	cudaFree(l2_out);
+	cudaFree(dev_L3);
+	cudaFree(l3_temp);
+	cudaFree(l3_temp2);
+	cudaFree(l3_temp3);
+	cudaFree(l3_temp4);
+
     
     return cudaStatus;
 }
