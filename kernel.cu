@@ -1,12 +1,19 @@
 /*
 Name: James Goodliffe
 Student ID: 1561223
-Tasks:
-Block Scan (Large Vectors)
-Block Conflict Avoidance Optimisation
+Tasks Achieved:
+**Host Block Scan
+**Host Full Scan
+**Block Scan (Large Vectors)
+**Full Scan (Large Vectors)
 
 Times:
-
+- Host Block Scan: 20.600ms
+- Host Full Scan: 43.392ms
+- Block Scan without BCAO: 1.996ms
+- Block Scan with BCAO: --ms (did not get working)
+- Full Scan without BCAO: 3.963ms
+- Full Scan with BCAO: --ms (did not get working)
 
 
 Hardware:
@@ -14,7 +21,7 @@ Intel Core i7 6700k - 4GHz, 4 Cores, 8 Threads
 nVidia GeForce GTX 1080 - 8GB GDDR5
 
 Implementation Information:
-
+I have spent over 48hours working on this implementation.
 
 */
 #include "cuda_runtime.h"
@@ -41,7 +48,10 @@ int SEGMENT_SIZE = 2 * BLOCK_SIZE;
 
 //Define functions...
 cudaError_t fullScan(int* out, int* in, const int size, int* sums_out, int* cumulative_sums, int* L2_out, int* L3_out); 
-cudaError_t fullScan_bcao(int* out, int* in, const int size);
+cudaError_t fullScan_bcao(int* out, int* in, const int size, int* sums_out, int* cumulative_sums, int* L2_out, int* L3_out);
+cudaError_t blockScan(int* out, int* in, const int size);
+cudaError_t blockScan_bcao(int* out, int* in, const int size);
+
 
 //Prescan with bank conflict avoidance...
 __global__ void preScan_bcao(int* outputData, int* inputData, int n, int ss) {
@@ -108,7 +118,7 @@ __global__ void preScan_bcao(int* outputData, int* inputData, int n, int ss) {
 	}
 }
 
-//Prescan, Sum
+//Kernels (CUDA Functions)
 //outputData - output array, inputData - input array, arraySize- arraysize, segSize- segment size
 __global__ void prescan_with_sum(int* outputData, int* inputData, int arraySize, int segSize, int* sums) {
 	extern __shared__ int temp[]; //Allocated on invocation - Pointer to shared memory
@@ -227,19 +237,46 @@ __global__ void prescan_without_sum(int* outputData, int* inputData, int arraySi
 	}
 }
 
-//Modifies the input array to have all values <blockSize with the SumsArray values...
-//Level 2 Scan.. 
+//Modifies the input array to have all values <blockSize with the SumsArray values... 
 __global__ void addSumsToScan(int* summedArray, int* inputArray, int* sumsArray) {
 	int gThreadID = blockIdx.x * blockDim.x + threadIdx.x;
 	summedArray[gThreadID] = inputArray[gThreadID] + sumsArray[(blockIdx.x/2)];
 	//printf("\n addSums: %d",summedArray[gThreadID]);
 }
 
-//Main Methodn
+
+//BlockScan - Host
+__host__ void hostBlockScan(int* out, int* in, int size){
+	for (int i = 0; i < size; i++){
+		out[i] = (i % SEGMENT_SIZE == 0) ? 0 : out[i - 1] + in[i - 1];
+	}
+}
+
+//FullScan - Host
+__host__ void hostFullScan(int* out, int* in, int size){
+	for (int i = 0; i < size; i++){
+		out[i] = (i == 0) ? 0 : out[i - 1] + in[i - 1];
+	}
+}
+
+//Compare two arrays.
+bool compareArray(int* arr1, int* arr2, int size) {
+	for (int i = 0; i < size; i++) {
+		//printf("\n arr1 i = %d, arr2 i = %d", arr1[i], arr2[i]);
+		if (arr1[i] != arr2[i]) {
+			return false;
+		} 
+	}
+	return true;
+}
+
+//Main Method
 int main()
 {
 	//Initialise array...k
-	const int arraySize = 5000000;
+	const int arraySize = 10000000;
+	printf("Running Block Scan for Array Size of %d...", arraySize);
+
 	int sumArraySize = ceil(arraySize / float(SEGMENT_SIZE));
 
 	//Malloc all arrays
@@ -251,62 +288,91 @@ int main()
 	int* outputArray2 = (int*)malloc(arraySize * sizeof(int));
 	int* l2Array = (int*)malloc(arraySize * sizeof(int));
 	int* l3Array = (int*)malloc(arraySize * sizeof(int));
+	int* blockScanReturn = (int*)malloc(arraySize * sizeof(int));
+	int* hostL3Array = (int*)malloc(arraySize * sizeof(int));
+	int* hostBlockScanArray = (int*)malloc(arraySize * sizeof(int));
+
 
 	//Create array to input...
 	for (int i = 0; i < arraySize; i++) {
-		inputArray[i] = 1;
+		inputArray[i] = rand() %10;
 		//printf("%d ", inputArray[i]);
 	}
 
-	//Create array to input...
+	//Create BCAO array to input...
 	for (int i = 0; i < arraySize; i++) {
-		inputArray2[i] = 1;
+		inputArray2[i] = rand() %10;
 		//printf("%d ", inputArray2[i]);
 	}
 
-	// Add vectors in parallel.
-	cudaError_t cudaStatus = fullScan(outputArray, inputArray, arraySize, sumsArray, cumSumsArray,l2Array,l3Array);
+	//Host BlockScan
+	StopWatchInterface* timer = NULL;
+	sdkCreateTimer(&timer);
+	sdkStartTimer(&timer);
+	hostBlockScan(hostBlockScanArray, inputArray, arraySize);
+	sdkStopTimer(&timer);
+	double h_msecs = sdkGetTimerValue(&timer);
+	printf("\nHost Block Scan time: %fms", h_msecs);
+	sdkDeleteTimer(&timer);
+
+	//BlockScan - without BCAO
+	printf("\n Running a Block Scan for %d items..", arraySize);
+	cudaError_t cudaStatus = blockScan(blockScanReturn, inputArray, arraySize);
 	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "Prescan failed!");
+		fprintf(stderr, "\nBlock Scan without BCAO failed!");
 		return 1;
 	}
 
-	//Output results
-	printf("\n\n L1 SCAN: \n");
-	for (int i = 0; i < arraySize; i++) {
-		//printf("%d ", outputArray[i]);
+	printf("\n Checking Block Scan Result... (without BCAO)");
+	if (compareArray(hostBlockScanArray, blockScanReturn, arraySize)) {
+		printf("\n Block Scan without BCAO successful.");
+	}
+	else {
+		printf("\n Block Scan without BCAO unsuccessful. Check for errors!");
 	}
 
-	//Output L2 Scan Results
-	printf("\n\n L2 SCAN: \n");
-	for (int i = 0; i < arraySize; i++) {
-		//printf("%d ", l2Array[i]);
-	}
+	//Host FullScan
+	StopWatchInterface* timer2 = NULL;
+	sdkCreateTimer(&timer2);
+	sdkStartTimer(&timer2);
+	hostFullScan(hostL3Array, inputArray, arraySize);
+	sdkStopTimer(&timer2);
+	double h_msecs2 = sdkGetTimerValue(&timer2);
+	printf("\nHost Full Scan time: %fms", h_msecs2);
+	sdkDeleteTimer(&timer2);
 
-	//Output L3 Scan Results
-	printf("\n\n L3 SCAN: \n");
-	for (int i = 0; i < arraySize; i++) {
-		printf("%d ", l3Array[i]);
-	}
-
-	// Add vectors in parallel - Bank Conflict Avoidance Optimisation
-	cudaError_t cudaStatus2 = fullScan_bcao(outputArray2, inputArray2, arraySize);
+	printf("\nNow running a Full Scan for %d items..", arraySize);
+	//FullScan - without BCAO
+	cudaError_t cudaStatus2 = fullScan(outputArray, inputArray, arraySize, sumsArray, cumSumsArray,l2Array,l3Array);
 	if (cudaStatus2 != cudaSuccess) {
-		fprintf(stderr, "Prescan failed! (bank conflict avoid)");
+		fprintf(stderr, "\nFull Scan without BCAO failed!");
 		return 1;
 	}
 
-	//Output results
-	printf("\n\n OUTPUT ARRAY: \n");
-	for (int i = 0; i < arraySize; i++) {
-		printf("%d ", outputArray2[i]);
+	//Check Results
+	printf("\n Checking Full Scan Result... (without BCAO)");
+	if (compareArray(hostL3Array,l3Array,arraySize)) {
+		printf("\n Full Scan without BCAO successful.");
 	}
+	else {
+		printf("\n Full Scan without BCAO unsuccessful. Check for errors!");
+	}
+
+	//BlockScan - BCAO
+	printf("\n Running a Block Scan (with BCAO) for %d items..", arraySize);
+	cudaError_t cudaStatus3 = blockScan_bcao(outputArray2, inputArray2, arraySize);
+	if (cudaStatus3 != cudaSuccess) {
+		fprintf(stderr, "BlockScan with BCAO failed! (bank conflict avoid)");
+		return 1;
+	}
+
+	//FullScan - BCAO
 
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
     cudaStatus = cudaDeviceReset();
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
+        fprintf(stderr, "\ncudaDeviceReset failed!");
         return 1;
     }
 
@@ -318,16 +384,14 @@ int main()
 	free(sumsArray);
 	free(l2Array);
 	free(l3Array);
+	free(hostBlockScanArray);
+	free(hostL3Array);
     return 0;
 }
 
-// Helper function for using CUDA to add vectors in parallel. size - array size;
+//FullScan - Without BCAO
 cudaError_t fullScan(int* out, int* in, const int arraySize, int* sums_out, int* cumulative_sums, int* L2_out, int* L3_out)
 {
-	//Init Stopwatch
-	StopWatchInterface* timer = NULL;
-	double h_msecs = NULL;
-
 	//Properties for prescan
 	int inputVectorSize = arraySize; //Size of the input vector (i.e. array)
 	int threadsPerBlock = 1024;
@@ -369,7 +433,7 @@ cudaError_t fullScan(int* out, int* in, const int arraySize, int* sums_out, int*
         goto Error;
     }
 
-    // Allocate GPU buffers for three vectors (one input, one output, one sums)    .
+    // Allocate GPU buffers for three vectors (one input, one output, one sums)
 
     cudaStatus = cudaMalloc((void**)&l1_in, arraySize * sizeof(int));
     if (cudaStatus != cudaSuccess) {
@@ -457,10 +521,6 @@ cudaError_t fullScan(int* out, int* in, const int arraySize, int* sums_out, int*
         goto Error;
 	}
 
-	//Start Std Timer.
-	sdkCreateTimer(&timer);
-	sdkStartTimer(&timer);
-
 	//Start Cuda Timer
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
@@ -489,7 +549,7 @@ cudaError_t fullScan(int* out, int* in, const int arraySize, int* sums_out, int*
     // Check for any errors launching the kernel
     cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+        fprintf(stderr, "\naddKernel launch failed: %s", cudaGetErrorString(cudaStatus));
         goto Error;
     }
     
@@ -497,18 +557,11 @@ cudaError_t fullScan(int* out, int* in, const int arraySize, int* sums_out, int*
     // any errors encountered during the launch.
     cudaStatus = cudaDeviceSynchronize();
 
-	//Stop timer.
-	sdkStopTimer(&timer);
-	h_msecs = sdkGetTimerValue(&timer); 
-	printf("\n Standard Timer-  Ran in %.5f ms", h_msecs);
-	sdkDeleteTimer(&timer);
-
-
 	//Stop CUDA timer
 	cudaEventRecord(stop, 0);
 	cudaEventSynchronize(stop);
 	cudaEventElapsedTime(&d_msecs, start, stop);
-	printf("\n CUDA Timer-  Ran in %.5f ms", d_msecs);
+	printf("\n Full Scan without BCAO -  Time taken:  %.5f ms", d_msecs);
 
 	cudaEventDestroy(start);
 	cudaEventDestroy(stop);
@@ -521,35 +574,35 @@ cudaError_t fullScan(int* out, int* in, const int arraySize, int* sums_out, int*
     // Scan - Copy output array from GPU buffer to host memory.
     cudaStatus = cudaMemcpy(out, l1_out, arraySize * sizeof(int), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "Failed to copy from GPU to Host!");
+        fprintf(stderr, "\nFailed to copy from GPU to Host!");
         goto Error;
     }
 
 	// Sums - Copy output sums from GPU buffer to host memory.
 	cudaStatus = cudaMemcpy(sums_out, dev_sums, dev_sums_size, cudaMemcpyDeviceToHost);
 	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "Failed to copy from GPU to Host!");
+		fprintf(stderr, "\nFailed to copy from GPU to Host!");
 		goto Error;
 	}
 
 	// Cumulative - Copy output sums from GPU buffer to host memory.
 	cudaStatus = cudaMemcpy(cumulative_sums, dev_cumulative, dev_sums_size, cudaMemcpyDeviceToHost);
 	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "Failed to copy from GPU to Host!");
+		fprintf(stderr, "\nFailed to copy from GPU to Host!");
 		goto Error;
 	}
 
 	// L2 - Copy output sums from GPU buffer to host memory.
 	cudaStatus = cudaMemcpy(L2_out, l2_out , arraySize*sizeof(int), cudaMemcpyDeviceToHost);
 	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "Failed to copy from GPU to Host!");
+		fprintf(stderr, "\nFailed to copy from GPU to Host!");
 		goto Error;
 	}
 
 	// L3 - Copy output sums from GPU buffer to host memory.
 	cudaStatus = cudaMemcpy(L3_out, dev_L3, arraySize * sizeof(int), cudaMemcpyDeviceToHost);
 	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "Failed to copy from GPU to Host!");
+		fprintf(stderr, "\nFailed to copy from GPU to Host!");
 		goto Error;
 	}
 
@@ -572,12 +625,9 @@ Error:
     return cudaStatus;
 }
 
-//FullScan2 - with Bank Conflict Avoidance Prescan...
-cudaError_t fullScan_bcao(int* out, int* in, const int size)
+//FullScan - with BCAO
+cudaError_t fullScan_bcao(int* out, int* in, const int size, int* sums_out, int* cumulative_sums, int* L2_out, int* L3_out)
 {
-	//Init Stopwatch
-	StopWatchInterface* timer = NULL;
-	double h_msecs = NULL;
 
 	//Properties for prescan
 	int inputVectorSize = size; //Size of the input vector (i.e. array)
@@ -624,10 +674,6 @@ cudaError_t fullScan_bcao(int* out, int* in, const int size)
 		goto Error;
 	}
 
-	//Start Std Timer.
-	sdkCreateTimer(&timer);
-	sdkStartTimer(&timer);
-
 	//Start Cuda Timer
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
@@ -647,18 +693,11 @@ cudaError_t fullScan_bcao(int* out, int* in, const int size)
 	// any errors encountered during the launch.
 	cudaStatus = cudaDeviceSynchronize();
 
-	//Stop timer.
-	sdkStopTimer(&timer);
-	h_msecs = sdkGetTimerValue(&timer);
-	printf("\n Bank Conflict - Standard Timer-  Ran in %.5f ms", h_msecs);
-	sdkDeleteTimer(&timer);
-
-
 	//Stop CUDA timer
 	cudaEventRecord(stop, 0);
 	cudaEventSynchronize(stop);
 	cudaEventElapsedTime(&d_msecs, start, stop);
-	printf("\n Bank Conflict - CUDA Timer-  Ran in %.5f ms", d_msecs);
+	printf("\n BCAO Full Scan Ran in %.5f ms", d_msecs);
 
 	cudaEventDestroy(start);
 	cudaEventDestroy(stop);
@@ -682,3 +721,194 @@ Error:
 	return cudaStatus;
 }
 
+//BlockScan - without BCAO
+cudaError_t blockScan(int* out, int* in, const int arraySize)
+{
+	//Properties for Block Scan
+	int inputVectorSize = arraySize; //Size of the input vector (i.e. array)
+	int threadsPerBlock = 1024;
+	int blocksPerGrid = ceil(inputVectorSize / (float)SEGMENT_SIZE);
+	int sharedMemAmount = (SEGMENT_SIZE) * sizeof(int); //Amount of shared memory given to prescan 
+
+	//Init cuda timer
+	cudaEvent_t start, stop;
+	float d_msecs;
+
+	//Initialise arrays
+	int* internalIn = 0; //Input array
+	int* internalOut = 0; //Output array
+
+	int dev_sums_size = ceil(arraySize / (float)SEGMENT_SIZE) * sizeof(int);
+
+	cudaError_t cudaStatus;
+
+	// Choose which GPU to run on, change this on a multi-GPU system.
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\ncudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+
+	// Allocate GPU buffers for two vectors (one input, one output)    .
+
+	cudaStatus = cudaMalloc((void**)&internalIn, arraySize * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&internalOut, arraySize * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	// Copy input vectors from host memory to GPU buffers.
+	cudaStatus = cudaMemcpy(internalIn, in, arraySize * sizeof(int), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\nFailed to copy input from system to GPU!");
+		goto Error;
+	}
+
+	//Start Cuda Timer
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start, 0);
+
+	//Level 2 - Run a prescan on the sums array.
+	prescan_without_sum <<<blocksPerGrid, threadsPerBlock, sharedMemAmount >> > (internalOut,internalIn,arraySize,SEGMENT_SIZE);
+
+
+	// Check for any errors launching the kernel
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	// cudaDeviceSynchronize waits for the kernel to finish, and returns
+	// any errors encountered during the launch.
+	cudaStatus = cudaDeviceSynchronize();
+
+	//Stop CUDA timer
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&d_msecs, start, stop);
+	printf("\nBlock Scan (without BCAO)-  Time taken: %.5fms", d_msecs);
+
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\ncudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+		goto Error;
+	}
+
+	// BlockScan - Copy output array from GPU buffer to host memory.
+	cudaStatus = cudaMemcpy(out, internalOut, arraySize * sizeof(int), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\nFailed to copy from GPU to Host!");
+		goto Error;
+	}
+
+Error:
+	cudaFree(internalIn);
+	cudaFree(internalOut);
+	return cudaStatus;
+}
+
+//BlockScan - with BCAO
+cudaError_t blockScan_bcao(int* out, int* in, const int arraySize)
+{
+	//Properties for Block Scan
+	int inputVectorSize = arraySize; //Size of the input vector (i.e. array)
+	int threadsPerBlock = 1024;
+	int blocksPerGrid = ceil(inputVectorSize / (float)SEGMENT_SIZE);
+	int sharedMemAmount = (SEGMENT_SIZE) * sizeof(int); //Amount of shared memory given to prescan 
+
+	//Init cuda timer
+	cudaEvent_t start, stop;
+	float d_msecs;
+
+	//Initialise arrays
+	int* internalIn = 0; //Input array
+	int* internalOut = 0; //Output array
+
+	int dev_sums_size = ceil(arraySize / (float)SEGMENT_SIZE) * sizeof(int);
+
+	cudaError_t cudaStatus;
+
+	// Choose which GPU to run on, change this on a multi-GPU system.
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\ncudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+
+	// Allocate GPU buffers for two vectors (one input, one output)    .
+
+	cudaStatus = cudaMalloc((void**)&internalIn, arraySize * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\ncudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&internalOut, arraySize * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\ncudaMalloc failed!");
+		goto Error;
+	}
+
+	// Copy input vectors from host memory to GPU buffers.
+	cudaStatus = cudaMemcpy(internalIn, in, arraySize * sizeof(int), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\nFailed to copy input from system to GPU!");
+		goto Error;
+	}
+
+	//Start Cuda Timer
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start, 0);
+
+	//Level 2 - Run a prescan on the sums array.
+	prescan_without_sum << <blocksPerGrid, threadsPerBlock, sharedMemAmount >> > (internalOut, internalIn, arraySize, SEGMENT_SIZE);
+
+
+	// Check for any errors launching the kernel
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\n addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	// cudaDeviceSynchronize waits for the kernel to finish, and returns
+	// any errors encountered during the launch.
+	cudaStatus = cudaDeviceSynchronize();
+
+	//Stop CUDA timer
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	cudaEventElapsedTime(&d_msecs, start, stop);
+	printf("\n Block Scan with BCAO -  Time taken: %.5f ms", d_msecs);
+
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\ncudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+		goto Error;
+	}
+
+	// BlockScan - Copy output array from GPU buffer to host memory.
+	cudaStatus = cudaMemcpy(out, internalOut, arraySize * sizeof(int), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "\nFailed to copy from GPU to Host!");
+		goto Error;
+	}
+
+Error:
+	cudaFree(internalIn);
+	cudaFree(internalOut);
+	return cudaStatus;
+}
